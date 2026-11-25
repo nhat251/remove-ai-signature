@@ -19,9 +19,21 @@ Open-source **Model Context Protocol (MCP)** server that enables AI Agents (Curs
 
 ## 🚀 Quick Setup
 
-Add `remove-ai-signature` to your MCP client configuration:
+### ⚡ Option A: Interactive Auto-Installer (Easiest)
 
-### 1. Universal Config (Cursor / Claude Desktop / Antigravity / Windsurf)
+Simply run this command directly in your terminal:
+
+```bash
+npx -y remove-ai-signature
+```
+
+An interactive configuration menu will appear in your terminal. Use **[Space]** to select your AI Agents (**Cursor IDE**, **Claude Desktop**, **Codex Desktop & CLI**, **Windsurf**, or **Antigravity**) and hit **[Enter]**. The tool will automatically locate your config files and install the MCP server!
+
+---
+
+### 🛠️ Option B: Manual Configuration
+
+#### 1. Universal Config (Cursor / Claude Desktop / Antigravity / Windsurf)
 
 Add to your MCP configuration file:
 - **Cursor**: `.cursor/mcp.json` or `Settings > Features > MCP`

@@ -9,6 +9,7 @@ import { execFile } from "node:child_process";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import readline from "node:readline";
 import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
@@ -184,7 +185,7 @@ async function getVideoInfo(filePath: string): Promise<VideoStreamInfo> {
 const server = new Server(
   {
     name: "remove-ai-signature",
-    version: "1.1.0",
+    version: "1.2.0",
   },
   {
     capabilities: {
@@ -1031,12 +1032,246 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   };
 });
 
-async function run() {
+interface AgentTarget {
+  id: string;
+  name: string;
+  configPath: string;
+  type: "json" | "toml";
+  checked: boolean;
+}
+
+function getAgentTargets(): AgentTarget[] {
+  const home = os.homedir();
+  const platform = os.platform();
+
+  let claudePath = path.join(home, ".config", "Claude", "claude_desktop_config.json");
+  if (platform === "darwin") {
+    claudePath = path.join(home, "Library", "Application Support", "Claude", "claude_desktop_config.json");
+  } else if (platform === "win32") {
+    claudePath = path.join(process.env.APPDATA || path.join(home, "AppData", "Roaming"), "Claude", "claude_desktop_config.json");
+  }
+
+  let windsurfPath = path.join(home, ".codeium", "windsurf", "mcp_config.json");
+  if (platform === "win32") {
+    windsurfPath = path.join(process.env.USERPROFILE || home, ".codeium", "windsurf", "mcp_config.json");
+  }
+
+  return [
+    {
+      id: "cursor",
+      name: "Cursor IDE",
+      configPath: path.join(home, ".cursor", "mcp.json"),
+      type: "json",
+      checked: true,
+    },
+    {
+      id: "claude",
+      name: "Claude Desktop",
+      configPath: claudePath,
+      type: "json",
+      checked: true,
+    },
+    {
+      id: "codex",
+      name: "Codex Desktop & CLI",
+      configPath: path.join(home, ".codex", "config.toml"),
+      type: "toml",
+      checked: true,
+    },
+    {
+      id: "windsurf",
+      name: "Windsurf",
+      configPath: windsurfPath,
+      type: "json",
+      checked: false,
+    },
+    {
+      id: "antigravity",
+      name: "Antigravity CLI",
+      configPath: path.join(home, ".gemini", "config", "mcp_config.json"),
+      type: "json",
+      checked: false,
+    },
+  ];
+}
+
+async function configureJsonAgent(configPath: string): Promise<void> {
+  await fs.mkdir(path.dirname(configPath), { recursive: true });
+  let content = "{}";
+  try {
+    content = await fs.readFile(configPath, "utf-8");
+  } catch {
+    // File does not exist yet
+  }
+
+  let json: Record<string, unknown> = {};
+  try {
+    json = JSON.parse(content);
+  } catch {
+    json = {};
+  }
+
+  if (typeof json !== "object" || json === null) {
+    json = {};
+  }
+
+  const mcpServers = (typeof json.mcpServers === "object" && json.mcpServers !== null)
+    ? (json.mcpServers as Record<string, unknown>)
+    : {};
+
+  mcpServers["remove-ai-signature"] = {
+    command: "npx",
+    args: ["-y", "remove-ai-signature"],
+  };
+
+  json.mcpServers = mcpServers;
+  await fs.writeFile(configPath, JSON.stringify(json, null, 2) + "\n", "utf-8");
+}
+
+async function configureTomlAgent(configPath: string): Promise<void> {
+  await fs.mkdir(path.dirname(configPath), { recursive: true });
+  let content = "";
+  try {
+    content = await fs.readFile(configPath, "utf-8");
+  } catch {
+    // File does not exist yet
+  }
+
+  if (content.includes("[mcp_servers.remove-ai-signature]")) {
+    return;
+  }
+
+  const snippet = `
+[mcp_servers.remove-ai-signature]
+command = "npx"
+args = ["-y", "remove-ai-signature"]
+`;
+
+  content = (content.trim() + "\n" + snippet).trim() + "\n";
+  await fs.writeFile(configPath, content, "utf-8");
+}
+
+async function runInteractiveInstaller(): Promise<void> {
+  const targets = getAgentTargets();
+  const home = os.homedir();
+
+  process.stdout.write(`\n\x1b[1;36m✨ remove-ai-signature v1.2.0 — Auto-Configuration Wizard\x1b[0m\n\n`);
+
+  const selectedTargets = await new Promise<AgentTarget[]>((resolve) => {
+    let cursorIndex = 0;
+    readline.emitKeypressEvents(process.stdin);
+    if (process.stdin.isTTY) {
+      process.stdin.setRawMode(true);
+    }
+
+    const render = (first = false) => {
+      if (!first) {
+        process.stdout.write(`\x1b[${targets.length + 3}A\x1b[0J`);
+      }
+      process.stdout.write(`\x1b[1mSelect the AI Agents you want to install remove-ai-signature for:\x1b[0m\n`);
+      process.stdout.write(`\x1b[90m(Use [↑/↓] to navigate, [Space] to toggle, [a] all, [Enter] to install)\x1b[0m\n\n`);
+
+      targets.forEach((target, idx) => {
+        const isHovered = idx === cursorIndex;
+        const pointer = isHovered ? "\x1b[36m❯\x1b[0m" : " ";
+        const box = target.checked ? "\x1b[32m[✔]\x1b[0m" : "\x1b[90m[ ]\x1b[0m";
+        const label = isHovered ? `\x1b[1;37m${target.name}\x1b[0m` : `\x1b[37m${target.name}\x1b[0m`;
+        const displayPath = target.configPath.replace(home, "~");
+        process.stdout.write(`${pointer} ${box} ${label.padEnd(28)} \x1b[90m${displayPath}\x1b[0m\n`);
+      });
+    };
+
+    render(true);
+
+    const onKeypress = (str: string, key: readline.Key) => {
+      if ((key.ctrl && key.name === "c") || key.name === "escape") {
+        cleanup();
+        process.stdout.write(`\n\x1b[33mInstallation cancelled.\x1b[0m\n`);
+        process.exit(0);
+      }
+
+      if (key.name === "up" || key.name === "k") {
+        cursorIndex = (cursorIndex - 1 + targets.length) % targets.length;
+        render();
+      } else if (key.name === "down" || key.name === "j") {
+        cursorIndex = (cursorIndex + 1) % targets.length;
+        render();
+      } else if (key.name === "space") {
+        targets[cursorIndex].checked = !targets[cursorIndex].checked;
+        render();
+      } else if (str === "a" || str === "A") {
+        const anyUnchecked = targets.some((t) => !t.checked);
+        targets.forEach((t) => (t.checked = anyUnchecked));
+        render();
+      } else if (key.name === "return" || key.name === "enter" || str === "\r" || str === "\n") {
+        cleanup();
+        process.stdout.write("\n");
+        resolve(targets.filter((t) => t.checked));
+      }
+    };
+
+    const cleanup = () => {
+      process.stdin.removeListener("keypress", onKeypress);
+      if (process.stdin.isTTY) {
+        process.stdin.setRawMode(false);
+      }
+      process.stdin.pause();
+    };
+
+    process.stdin.on("keypress", onKeypress);
+  });
+
+  if (selectedTargets.length === 0) {
+    process.stdout.write(`\x1b[33mNo agents selected. Nothing configured.\x1b[0m\n\n`);
+    return;
+  }
+
+  process.stdout.write(`\x1b[1;34m⚙️  Configuring selected AI Agents...\x1b[0m\n\n`);
+
+  for (const target of selectedTargets) {
+    try {
+      if (target.type === "json") {
+        await configureJsonAgent(target.configPath);
+      } else {
+        await configureTomlAgent(target.configPath);
+      }
+      const displayPath = target.configPath.replace(home, "~");
+      process.stdout.write(`  \x1b[32m✔\x1b[0m Configured \x1b[1m${target.name}\x1b[0m \x1b[90m(${displayPath})\x1b[0m\n`);
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      process.stdout.write(`  \x1b[31m✖\x1b[0m Failed to configure \x1b[1m${target.name}\x1b[0m: ${msg}\n`);
+    }
+  }
+
+  process.stdout.write(`\n\x1b[1;32m🎉 remove-ai-signature successfully installed!\x1b[0m\n`);
+  process.stdout.write(`\x1b[90mPlease restart your AI Agent (Cursor / Claude / Codex / Windsurf) to start using the tools.\x1b[0m\n\n`);
+}
+
+async function runMcpServer(): Promise<void> {
   const transport = new StdioServerTransport();
   await server.connect(transport);
 }
 
-run().catch((error) => {
+async function main() {
+  const isStdioExplicit = process.argv.includes("--stdio") || process.argv.includes("server");
+  const isInstallExplicit = process.argv.includes("install") || process.argv.includes("--install");
+
+  if (isInstallExplicit) {
+    await runInteractiveInstaller();
+    return;
+  }
+
+  // If piped into or spawned by an MCP host (non-TTY stdin) or explicitly requested stdio:
+  if (!process.stdin.isTTY || isStdioExplicit) {
+    await runMcpServer();
+    return;
+  }
+
+  // If executed in an interactive terminal by a human:
+  await runInteractiveInstaller();
+}
+
+main().catch((error) => {
   process.stderr.write(`Fatal error: ${error}\n`);
   process.exit(1);
 });
