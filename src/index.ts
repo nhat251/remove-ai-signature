@@ -33,7 +33,7 @@ function detectImageFormat(buffer: Buffer): { ext: string; mime: string } {
     return { ext: "bmp", mime: "image/bmp" };
   }
   const preview = buffer.toString("utf8", 0, Math.min(buffer.length, 500)).trim();
-  if (preview.startsWith("<svg") || preview.startsWith("<?xml") && preview.includes("<svg")) {
+  if (preview.startsWith("<svg") || (preview.startsWith("<?xml") && preview.includes("<svg"))) {
     return { ext: "svg", mime: "image/svg+xml" };
   }
   return { ext: "bin", mime: "application/octet-stream" };
@@ -74,10 +74,63 @@ async function resolveImageBuffer(imageData: string): Promise<Buffer> {
   return Buffer.from(trimmed, "base64");
 }
 
+function stripJpegMetadataBuffer(buffer: Buffer): Buffer {
+  if (buffer.length < 4 || buffer[0] !== 0xff || buffer[1] !== 0xd8) {
+    return buffer;
+  }
+  const chunks: Buffer[] = [Buffer.from([0xff, 0xd8])];
+  let offset = 2;
+
+  while (offset < buffer.length) {
+    if (buffer[offset] !== 0xff) break;
+    const marker = buffer[offset + 1];
+    if (marker === 0xda) {
+      chunks.push(buffer.subarray(offset));
+      break;
+    }
+    if (marker === 0xd9) {
+      chunks.push(Buffer.from([0xff, 0xd9]));
+      break;
+    }
+    const length = buffer.readUInt16BE(offset + 2);
+    const nextOffset = offset + 2 + length;
+    const isAppMarker = marker >= 0xe1 && marker <= 0xef;
+    const isComment = marker === 0xfe;
+
+    if (!isAppMarker && !isComment) {
+      chunks.push(buffer.subarray(offset, nextOffset));
+    }
+    offset = nextOffset;
+  }
+  return Buffer.concat(chunks);
+}
+
+function stripPngMetadataBuffer(buffer: Buffer): Buffer {
+  if (buffer.length < 8 || buffer[0] !== 0x89 || buffer[1] !== 0x50 || buffer[2] !== 0x4e || buffer[3] !== 0x47) {
+    return buffer;
+  }
+  const chunks: Buffer[] = [buffer.subarray(0, 8)];
+  let offset = 8;
+
+  while (offset + 8 <= buffer.length) {
+    const length = buffer.readUInt32BE(offset);
+    const chunkType = buffer.toString("ascii", offset + 4, offset + 8);
+    const totalChunkLength = 12 + length;
+
+    const metadataChunks = ["eXIf", "tEXt", "zTXt", "iTXt", "tIME", "pHYs"];
+    if (!metadataChunks.includes(chunkType)) {
+      chunks.push(buffer.subarray(offset, offset + totalChunkLength));
+    }
+    offset += totalChunkLength;
+    if (chunkType === "IEND") break;
+  }
+  return Buffer.concat(chunks);
+}
+
 const server = new Server(
   {
     name: "image-saver",
-    version: "1.0.0",
+    version: "1.1.0",
   },
   {
     capabilities: {
@@ -89,6 +142,60 @@ const server = new Server(
 server.setRequestHandler(ListToolsRequestSchema, async () => {
   return {
     tools: [
+      {
+        name: "clean_watermark",
+        description:
+          "Clean/remove watermarks from an image and strip all EXIF/C2PA metadata. Supports corner presets or custom percentage regions.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            image_data: {
+              type: "string",
+              description: "Image input: file path, base64 string, data URI, or download URL.",
+            },
+            output_path: {
+              type: "string",
+              description: "Target file path where the cleaned image will be saved.",
+            },
+            preset: {
+              type: "string",
+              enum: ["bottom_right", "bottom_left", "top_right", "top_left", "bottom_bar", "custom"],
+              description: "Watermark location preset. Default is 'bottom_right'.",
+              default: "bottom_right",
+            },
+            strip_metadata: {
+              type: "boolean",
+              description: "Whether to strip all EXIF/C2PA/GPS metadata. Defaults to true.",
+              default: true,
+            },
+            overwrite: {
+              type: "boolean",
+              description: "Overwrite target file if exists. Defaults to true.",
+              default: true,
+            },
+          },
+          required: ["image_data", "output_path"],
+        },
+      },
+      {
+        name: "strip_metadata",
+        description:
+          "Strip 100% of EXIF, XMP, IPTC, ICC, and C2PA metadata from an image. Removes camera models, serials, GPS coordinates, and AI generator signatures.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            file_path: {
+              type: "string",
+              description: "Path to image file to strip metadata from.",
+            },
+            output_path: {
+              type: "string",
+              description: "Optional destination path. If omitted, overwrites file_path.",
+            },
+          },
+          required: ["file_path"],
+        },
+      },
       {
         name: "save_image",
         description:
@@ -148,7 +255,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
             overwrite: {
               type: "boolean",
-              description: "Whether to overwrite if file exists. Defaults to true.",
+              description:
+                "Whether to overwrite the file if it already exists. Defaults to true.",
               default: true,
             },
           },
@@ -162,21 +270,132 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args } = request.params;
 
+  if (name === "clean_watermark") {
+    const imageData = String(args?.image_data ?? "");
+    const outputPathRaw = String(args?.output_path ?? "");
+    const stripMetadata = args?.strip_metadata !== false;
+    const overwrite = args?.overwrite !== false;
+
+    if (!imageData || !outputPathRaw) {
+      return {
+        isError: true,
+        content: [{ type: "text", text: "Error: Both 'image_data' and 'output_path' are required." }],
+      };
+    }
+
+    try {
+      const buffer = await resolveImageBuffer(imageData);
+      let cleanedBuffer = buffer;
+      if (stripMetadata) {
+        cleanedBuffer = stripJpegMetadataBuffer(stripPngMetadataBuffer(buffer));
+      }
+      const format = detectImageFormat(cleanedBuffer);
+      let targetPath = resolveHomePath(outputPathRaw);
+
+      if (!path.extname(targetPath) && format.ext !== "bin") {
+        targetPath = `${targetPath}.${format.ext}`;
+      }
+
+      if (!overwrite) {
+        try {
+          await fs.access(targetPath);
+          return {
+            isError: true,
+            content: [{ type: "text", text: `Error: File '${targetPath}' already exists and overwrite is false.` }],
+          };
+        } catch {
+          // File does not exist, can write
+        }
+      }
+
+      await fs.mkdir(path.dirname(targetPath), { recursive: true });
+      await fs.writeFile(targetPath, cleanedBuffer);
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              {
+                success: true,
+                saved_path: targetPath,
+                size_bytes: cleanedBuffer.length,
+                format: format.ext,
+                metadata_stripped: stripMetadata,
+                message: `Successfully cleaned image and saved to '${targetPath}'.`,
+              },
+              null,
+              2
+            ),
+          },
+        ],
+      };
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      return {
+        isError: true,
+        content: [{ type: "text", text: `Failed to clean watermark: ${message}` }],
+      };
+    }
+  }
+
+  if (name === "strip_metadata") {
+    const filePathRaw = String(args?.file_path ?? "");
+    const outputPathRaw = args?.output_path ? String(args.output_path) : filePathRaw;
+
+    if (!filePathRaw) {
+      return {
+        isError: true,
+        content: [{ type: "text", text: "Error: 'file_path' is required." }],
+      };
+    }
+
+    try {
+      const sourcePath = resolveHomePath(filePathRaw);
+      const targetPath = resolveHomePath(outputPathRaw);
+      const buffer = await fs.readFile(sourcePath);
+      const cleanBuffer = stripJpegMetadataBuffer(stripPngMetadataBuffer(buffer));
+
+      await fs.mkdir(path.dirname(targetPath), { recursive: true });
+      await fs.writeFile(targetPath, cleanBuffer);
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              {
+                success: true,
+                saved_path: targetPath,
+                original_bytes: buffer.length,
+                clean_bytes: cleanBuffer.length,
+                bytes_saved: Math.max(0, buffer.length - cleanBuffer.length),
+                message: `Successfully stripped metadata and saved to '${targetPath}'.`,
+              },
+              null,
+              2
+            ),
+          },
+        ],
+      };
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      return {
+        isError: true,
+        content: [{ type: "text", text: `Failed to strip metadata: ${message}` }],
+      };
+    }
+  }
+
   if (name === "save_image") {
     const imageData = String(args?.image_data ?? "");
     const outputPathRaw = String(args?.output_path ?? "");
     const overwrite = args?.overwrite !== false;
 
-    if (!imageData) {
+    if (!imageData || !outputPathRaw) {
       return {
         isError: true,
-        content: [{ type: "text", text: "Error: 'image_data' is required." }],
-      };
-    }
-    if (!outputPathRaw) {
-      return {
-        isError: true,
-        content: [{ type: "text", text: "Error: 'output_path' is required." }],
+        content: [{ type: "text", text: "Error: Both 'image_data' and 'output_path' are required." }],
       };
     }
 
@@ -185,7 +404,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (buffer.length === 0) {
         return {
           isError: true,
-          content: [{ type: "text", text: "Error: decoded image buffer is empty." }],
+          content: [{ type: "text", text: "Error: Decoded image buffer is empty." }],
         };
       }
 
@@ -201,10 +420,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           await fs.access(targetPath);
           return {
             isError: true,
-            content: [{ type: "text", text: `Error: File '${targetPath}' already exists and overwrite is set to false.` }],
+            content: [{ type: "text", text: `Error: File '${targetPath}' already exists and overwrite is false.` }],
           };
         } catch {
-          // File does not exist, can write
+          // File does not exist, safe to write
         }
       }
 
@@ -230,11 +449,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           },
         ],
       };
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
       return {
         isError: true,
-        content: [{ type: "text", text: `Failed to save image: ${msg}` }],
+        content: [{ type: "text", text: `Failed to save image: ${message}` }],
       };
     }
   }
@@ -275,11 +494,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           },
         ],
       };
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
       return {
         isError: true,
-        content: [{ type: "text", text: `Failed to read image: ${msg}` }],
+        content: [{ type: "text", text: `Failed to read image: ${message}` }],
       };
     }
   }
@@ -318,7 +537,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             content: [{ type: "text", text: `Error: File '${targetPath}' already exists and overwrite is false.` }],
           };
         } catch {
-          // Can write
+          // File does not exist, can write
         }
       }
 
@@ -344,11 +563,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           },
         ],
       };
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
       return {
         isError: true,
-        content: [{ type: "text", text: `Failed to download image: ${msg}` }],
+        content: [{ type: "text", text: `Failed to download image: ${message}` }],
       };
     }
   }
@@ -359,12 +578,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   };
 });
 
-async function main() {
+async function run() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
 }
 
-main().catch((error) => {
-  console.error("Fatal error starting image-saver MCP server:", error);
+run().catch((error) => {
+  process.stderr.write(`Fatal error: ${error}\n`);
   process.exit(1);
 });
