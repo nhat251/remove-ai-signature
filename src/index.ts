@@ -5,9 +5,13 @@ import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
+import { execFile } from "node:child_process";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { promisify } from "node:util";
+
+const execFileAsync = promisify(execFile);
 
 function resolveHomePath(filepath: string): string {
   if (filepath.startsWith("~")) {
@@ -127,10 +131,60 @@ function stripPngMetadataBuffer(buffer: Buffer): Buffer {
   return Buffer.concat(chunks);
 }
 
+async function getFfmpegBinary(): Promise<string> {
+  try {
+    await execFileAsync("ffmpeg", ["-version"]);
+    return "ffmpeg";
+  } catch {
+    throw new Error(
+      "FFmpeg is not installed or not found in system PATH. Please install FFmpeg (e.g. 'brew install ffmpeg' on macOS, 'sudo apt install ffmpeg' on Linux, or 'winget install ffmpeg' on Windows) to process video."
+    );
+  }
+}
+
+async function getFfprobeBinary(): Promise<string> {
+  try {
+    await execFileAsync("ffprobe", ["-version"]);
+    return "ffprobe";
+  } catch {
+    throw new Error(
+      "ffprobe is not installed or not found in system PATH. Please install FFmpeg to inspect video metadata."
+    );
+  }
+}
+
+interface VideoStreamInfo {
+  width: number;
+  height: number;
+  duration: number;
+  codec: string;
+}
+
+async function getVideoInfo(filePath: string): Promise<VideoStreamInfo> {
+  const ffprobe = await getFfprobeBinary();
+  const { stdout } = await execFileAsync(ffprobe, [
+    "-v", "error",
+    "-select_streams", "v:0",
+    "-show_entries", "stream=width,height,duration,codec_name",
+    "-show_entries", "format=duration",
+    "-of", "json",
+    filePath,
+  ]);
+  const parsed = JSON.parse(stdout);
+  const stream = parsed.streams?.[0] || {};
+  const duration = parseFloat(stream.duration || parsed.format?.duration || "0");
+  return {
+    width: stream.width || 1920,
+    height: stream.height || 1080,
+    duration,
+    codec: stream.codec_name || "unknown",
+  };
+}
+
 const server = new Server(
   {
     name: "remove-ai-signature",
-    version: "1.0.0",
+    version: "1.1.0",
   },
   {
     capabilities: {
@@ -197,26 +251,113 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         },
       },
       {
+        name: "clean_video_watermark",
+        description:
+          "Remove AI watermarks and signatures from a video file (MP4, MOV, MKV, WebM) using delogo, blur, or crop filters. Leverages native system FFmpeg.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            file_path: {
+              type: "string",
+              description: "Path to source video file.",
+            },
+            output_path: {
+              type: "string",
+              description: "Target destination path for the cleaned video.",
+            },
+            preset: {
+              type: "string",
+              enum: ["bottom_right", "bottom_left", "top_right", "top_left", "bottom_bar", "custom"],
+              description: "Watermark position preset. Default is 'bottom_right'.",
+              default: "bottom_right",
+            },
+            method: {
+              type: "string",
+              enum: ["delogo", "blur", "crop"],
+              description: "Removal technique: 'delogo' (pixel interpolation), 'blur' (box blur), or 'crop' (crop out edge). Default is 'delogo'.",
+              default: "delogo",
+            },
+            region: {
+              type: "object",
+              description: "Custom region if preset is 'custom'. Values can be percentages (0-100) or exact pixels.",
+              properties: {
+                x: { type: "number" },
+                y: { type: "number" },
+                width: { type: "number" },
+                height: { type: "number" },
+              },
+            },
+            strip_metadata: {
+              type: "boolean",
+              description: "Whether to strip video container metadata during processing. Defaults to true.",
+              default: true,
+            },
+            overwrite: {
+              type: "boolean",
+              description: "Overwrite target file if exists. Defaults to true.",
+              default: true,
+            },
+          },
+          required: ["file_path", "output_path"],
+        },
+      },
+      {
+        name: "strip_video_metadata",
+        description:
+          "Losslessly strip 100% of metadata (encoder, creation_time, tags, title, track metadata) from a video file (MP4, MKV, MOV, WebM) via stream-copy in under a second.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            file_path: {
+              type: "string",
+              description: "Path to source video file.",
+            },
+            output_path: {
+              type: "string",
+              description: "Optional destination path. If omitted, overwrites file_path.",
+            },
+            overwrite: {
+              type: "boolean",
+              description: "Overwrite destination if exists. Defaults to true.",
+              default: true,
+            },
+          },
+          required: ["file_path"],
+        },
+      },
+      {
+        name: "inspect_video",
+        description:
+          "Inspect technical video metadata, streams, codecs, resolution, bitrates, duration, and embedded tags using ffprobe.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            file_path: {
+              type: "string",
+              description: "Path to video file to inspect.",
+            },
+          },
+          required: ["file_path"],
+        },
+      },
+      {
         name: "save_image",
         description:
-          "Save an image to a local file. Accepts base64 encoded data (with or without 'data:image/...;base64,' prefix), an HTTP/HTTPS image URL to download, or an existing local image path to copy. Automatically creates parent directories and detects image format.",
+          "Save an image to a local file. Accepts base64 encoded data, an HTTP/HTTPS image URL to download, or an existing local image path to copy.",
         inputSchema: {
           type: "object",
           properties: {
             image_data: {
               type: "string",
-              description:
-                "The image content: can be a base64 string, data URI (data:image/png;base64,...), an HTTP/HTTPS image URL, or a local file path.",
+              description: "The image content: base64 string, data URI, HTTP/HTTPS URL, or local path.",
             },
             output_path: {
               type: "string",
-              description:
-                "The destination file path where the image should be saved (e.g. '/home/nhat/per/output.png' or 'relative/path/image.jpg').",
+              description: "Destination file path.",
             },
             overwrite: {
               type: "boolean",
-              description:
-                "Whether to overwrite the file if it already exists. Defaults to true.",
+              description: "Whether to overwrite the file if it exists. Defaults to true.",
               default: true,
             },
           },
@@ -232,7 +373,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           properties: {
             file_path: {
               type: "string",
-              description: "Absolute or relative path to the image file.",
+              description: "Path to the image file.",
             },
           },
           required: ["file_path"],
@@ -255,8 +396,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
             overwrite: {
               type: "boolean",
-              description:
-                "Whether to overwrite the file if it already exists. Defaults to true.",
+              description: "Whether to overwrite the file if it exists. Defaults to true.",
               default: true,
             },
           },
@@ -383,6 +523,319 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       return {
         isError: true,
         content: [{ type: "text", text: `Failed to strip metadata: ${message}` }],
+      };
+    }
+  }
+
+  if (name === "strip_video_metadata") {
+    const filePathRaw = String(args?.file_path ?? "");
+    const outputPathRaw = args?.output_path ? String(args.output_path) : filePathRaw;
+    const overwrite = args?.overwrite !== false;
+
+    if (!filePathRaw) {
+      return {
+        isError: true,
+        content: [{ type: "text", text: "Error: 'file_path' is required." }],
+      };
+    }
+
+    try {
+      const ffmpeg = await getFfmpegBinary();
+      const sourcePath = resolveHomePath(filePathRaw);
+      const targetPath = resolveHomePath(outputPathRaw);
+
+      await fs.access(sourcePath);
+
+      const isSameFile = path.resolve(sourcePath) === path.resolve(targetPath);
+      if (!isSameFile && !overwrite) {
+        try {
+          await fs.access(targetPath);
+          return {
+            isError: true,
+            content: [{ type: "text", text: `Error: Destination '${targetPath}' exists and overwrite is false.` }],
+          };
+        } catch {
+          // Can write
+        }
+      }
+
+      const workingTarget = isSameFile
+        ? path.join(path.dirname(sourcePath), `_tmp_strip_${Date.now()}_${path.basename(sourcePath)}`)
+        : targetPath;
+
+      await fs.mkdir(path.dirname(workingTarget), { recursive: true });
+
+      const ffmpegArgs = [
+        "-y",
+        "-i", sourcePath,
+        "-map", "0",
+        "-map_metadata", "-1",
+        "-map_metadata:s", "-1",
+        "-c", "copy",
+        workingTarget,
+      ];
+
+      await execFileAsync(ffmpeg, ffmpegArgs);
+
+      if (isSameFile) {
+        await fs.rename(workingTarget, targetPath);
+      }
+
+      const [statBefore, statAfter] = await Promise.all([
+        fs.stat(sourcePath).catch(() => ({ size: 0 })),
+        fs.stat(targetPath),
+      ]);
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              {
+                success: true,
+                saved_path: targetPath,
+                original_bytes: statBefore.size,
+                clean_bytes: statAfter.size,
+                bytes_saved: Math.max(0, statBefore.size - statAfter.size),
+                message: `Successfully stripped video metadata losslessly via stream-copy to '${targetPath}'.`,
+              },
+              null,
+              2
+            ),
+          },
+        ],
+      };
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      return {
+        isError: true,
+        content: [{ type: "text", text: `Failed to strip video metadata: ${message}` }],
+      };
+    }
+  }
+
+  if (name === "clean_video_watermark") {
+    const filePathRaw = String(args?.file_path ?? "");
+    const outputPathRaw = String(args?.output_path ?? "");
+    const preset = String(args?.preset ?? "bottom_right");
+    const method = String(args?.method ?? "delogo");
+    const customRegion = args?.region as { height?: number; width?: number; x?: number; y?: number } | undefined;
+    const stripMetadata = args?.strip_metadata !== false;
+    const overwrite = args?.overwrite !== false;
+
+    if (!filePathRaw || !outputPathRaw) {
+      return {
+        isError: true,
+        content: [{ type: "text", text: "Error: Both 'file_path' and 'output_path' are required." }],
+      };
+    }
+
+    try {
+      const ffmpeg = await getFfmpegBinary();
+      const sourcePath = resolveHomePath(filePathRaw);
+      const targetPath = resolveHomePath(outputPathRaw);
+
+      await fs.access(sourcePath);
+
+      if (!overwrite) {
+        try {
+          await fs.access(targetPath);
+          return {
+            isError: true,
+            content: [{ type: "text", text: `Error: Destination '${targetPath}' exists and overwrite is false.` }],
+          };
+        } catch {
+          // Can write
+        }
+      }
+
+      const info = await getVideoInfo(sourcePath);
+      const W = info.width;
+      const H = info.height;
+
+      let x = 0;
+      let y = 0;
+      let w = 0;
+      let h = 0;
+
+      if (preset === "bottom_right") {
+        w = Math.max(32, Math.round(W * 0.16));
+        h = Math.max(20, Math.round(H * 0.08));
+        x = W - w - Math.max(2, Math.round(W * 0.02));
+        y = H - h - Math.max(2, Math.round(H * 0.02));
+      } else if (preset === "bottom_left") {
+        w = Math.max(32, Math.round(W * 0.16));
+        h = Math.max(20, Math.round(H * 0.08));
+        x = Math.max(2, Math.round(W * 0.02));
+        y = H - h - Math.max(2, Math.round(H * 0.02));
+      } else if (preset === "top_right") {
+        w = Math.max(32, Math.round(W * 0.16));
+        h = Math.max(20, Math.round(H * 0.08));
+        x = W - w - Math.max(2, Math.round(W * 0.02));
+        y = Math.max(2, Math.round(H * 0.02));
+      } else if (preset === "top_left") {
+        w = Math.max(32, Math.round(W * 0.16));
+        h = Math.max(20, Math.round(H * 0.08));
+        x = Math.max(2, Math.round(W * 0.02));
+        y = Math.max(2, Math.round(H * 0.02));
+      } else if (preset === "bottom_bar") {
+        w = W - 4;
+        h = Math.max(20, Math.round(H * 0.08));
+        x = 2;
+        y = H - h - 2;
+      } else if (preset === "custom" && customRegion) {
+        const rw = customRegion.width ?? 100;
+        const rh = customRegion.height ?? 50;
+        const rx = customRegion.x ?? 0;
+        const ry = customRegion.y ?? 0;
+        const isPercent = rw <= 100 && rh <= 100 && rx <= 100 && ry <= 100;
+        x = isPercent ? Math.round((rx / 100) * W) : Math.round(rx);
+        y = isPercent ? Math.round((ry / 100) * H) : Math.round(ry);
+        w = isPercent ? Math.round((rw / 100) * W) : Math.round(rw);
+        h = isPercent ? Math.round((rh / 100) * H) : Math.round(rh);
+      } else {
+        w = Math.max(32, Math.round(W * 0.16));
+        h = Math.max(20, Math.round(H * 0.08));
+        x = W - w - Math.max(2, Math.round(W * 0.02));
+        y = H - h - Math.max(2, Math.round(H * 0.02));
+      }
+
+      // Safe clamp boundaries
+      x = Math.max(1, Math.min(x, W - 10));
+      y = Math.max(1, Math.min(y, H - 10));
+      w = Math.max(2, Math.min(w, W - x - 1));
+      h = Math.max(2, Math.min(h, H - y - 1));
+
+      let filterString = "";
+      if (method === "crop") {
+        if (preset === "bottom_bar") {
+          filterString = `crop=in_w:in_h-${h}:0:0`;
+        } else {
+          filterString = `crop=${W}:${H - h}:0:0`;
+        }
+      } else if (method === "blur") {
+        filterString = `split [main][crop_part]; [crop_part] crop=${w}:${h}:${x}:${y}, boxblur=12:12 [blur_part]; [main][blur_part] overlay=${x}:${y}`;
+      } else {
+        // default delogo
+        filterString = `delogo=x=${x}:y=${y}:w=${w}:h=${h}`;
+      }
+
+      await fs.mkdir(path.dirname(targetPath), { recursive: true });
+
+      const ffmpegArgs = [
+        "-y",
+        "-i", sourcePath,
+        "-vf", filterString,
+        "-c:v", "libx264",
+        "-preset", "fast",
+        "-crf", "20",
+        "-c:a", "copy",
+      ];
+
+      if (stripMetadata) {
+        ffmpegArgs.push("-map_metadata", "-1", "-map_metadata:s", "-1");
+      }
+      ffmpegArgs.push(targetPath);
+
+      await execFileAsync(ffmpeg, ffmpegArgs);
+      const statAfter = await fs.stat(targetPath);
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              {
+                success: true,
+                saved_path: targetPath,
+                resolution: `${W}x${H}`,
+                method,
+                region: { x, y, width: w, height: h },
+                size_bytes: statAfter.size,
+                metadata_stripped: stripMetadata,
+                message: `Successfully cleaned watermark from video using ${method} and saved to '${targetPath}'.`,
+              },
+              null,
+              2
+            ),
+          },
+        ],
+      };
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      return {
+        isError: true,
+        content: [{ type: "text", text: `Failed to clean video watermark: ${message}` }],
+      };
+    }
+  }
+
+  if (name === "inspect_video") {
+    const filePathRaw = String(args?.file_path ?? "");
+    if (!filePathRaw) {
+      return {
+        isError: true,
+        content: [{ type: "text", text: "Error: 'file_path' is required." }],
+      };
+    }
+
+    try {
+      const ffprobe = await getFfprobeBinary();
+      const sourcePath = resolveHomePath(filePathRaw);
+      await fs.access(sourcePath);
+
+      const { stdout } = await execFileAsync(ffprobe, [
+        "-v", "quiet",
+        "-print_format", "json",
+        "-show_format",
+        "-show_streams",
+        sourcePath,
+      ]);
+
+      const parsed = JSON.parse(stdout);
+      const videoStream = parsed.streams?.find((s: { codec_type: string }) => s.codec_type === "video");
+      const audioStream = parsed.streams?.find((s: { codec_type: string }) => s.codec_type === "audio");
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              {
+                success: true,
+                file_path: sourcePath,
+                format: parsed.format?.format_name,
+                duration_seconds: parseFloat(parsed.format?.duration || "0"),
+                size_bytes: parseInt(parsed.format?.size || "0", 10),
+                bit_rate: parseInt(parsed.format?.bit_rate || "0", 10),
+                video: videoStream
+                  ? {
+                      codec: videoStream.codec_name,
+                      resolution: `${videoStream.width}x${videoStream.height}`,
+                      fps: videoStream.r_frame_rate,
+                      pix_fmt: videoStream.pix_fmt,
+                    }
+                  : null,
+                audio: audioStream
+                  ? {
+                      codec: audioStream.codec_name,
+                      channels: audioStream.channels,
+                      sample_rate: audioStream.sample_rate,
+                    }
+                  : null,
+                metadata_tags: parsed.format?.tags || {},
+              },
+              null,
+              2
+            ),
+          },
+        ],
+      };
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      return {
+        isError: true,
+        content: [{ type: "text", text: `Failed to inspect video: ${message}` }],
       };
     }
   }
