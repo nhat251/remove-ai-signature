@@ -6,7 +6,9 @@ import {
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 import { execFile } from "node:child_process";
+import dns from "node:dns/promises";
 import fs from "node:fs/promises";
+import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import readline from "node:readline";
@@ -14,11 +16,262 @@ import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
 
+const MAX_IMAGE_BYTES = 50 * 1024 * 1024;
+const HTTP_TIMEOUT_MS = 15000;
+
+const SENSITIVE_FILENAMES = new Set([
+  ".env",
+  ".git",
+  ".ssh",
+  ".aws",
+  ".gnupg",
+  ".npmrc",
+  ".bashrc",
+  ".bash_profile",
+  ".bash_history",
+  ".zshrc",
+  ".profile",
+  "id_rsa",
+  "id_ed25519",
+  "authorized_keys",
+  "known_hosts",
+  "passwd",
+  "shadow",
+]);
+
+const SENSITIVE_DIRS = [
+  "/etc",
+  "/proc",
+  "/sys",
+  "/dev",
+  "/boot",
+  "/root",
+  "/var/run",
+  "/var/log",
+];
+
+const ALLOWED_IMAGE_EXTS = new Set([
+  ".jpg",
+  ".jpeg",
+  ".png",
+  ".webp",
+  ".gif",
+  ".bmp",
+  ".svg",
+]);
+
+const ALLOWED_VIDEO_EXTS = new Set([
+  ".mp4",
+  ".mov",
+  ".mkv",
+  ".webm",
+  ".avi",
+  ".m4v",
+]);
+
 function resolveHomePath(filepath: string): string {
   if (filepath.startsWith("~")) {
     return path.join(os.homedir(), filepath.slice(1));
   }
   return path.resolve(filepath);
+}
+
+function checkSensitivePath(targetPath: string): void {
+  const normalized = path.normalize(targetPath);
+  const parts = normalized.split(path.sep);
+
+  for (const part of parts) {
+    if (!part) continue;
+    const lower = part.toLowerCase();
+    const parsed = path.parse(lower);
+    const stem = parsed.name;
+
+    if (
+      SENSITIVE_FILENAMES.has(lower) ||
+      SENSITIVE_FILENAMES.has(stem) ||
+      lower.startsWith(".env") ||
+      stem.startsWith(".env") ||
+      stem.startsWith(".bash") ||
+      stem.startsWith(".zsh") ||
+      stem.startsWith(".ssh") ||
+      stem.startsWith(".aws") ||
+      stem.startsWith(".config") ||
+      stem.startsWith(".git")
+    ) {
+      throw new Error(`Access denied: Access to sensitive file or directory '${part}' is forbidden.`);
+    }
+  }
+
+  for (const dir of SENSITIVE_DIRS) {
+    if (normalized === dir || normalized.startsWith(dir + path.sep)) {
+      throw new Error(`Access denied: System directory '${dir}' is restricted.`);
+    }
+  }
+
+  if (process.platform === "win32") {
+    const winDir = (process.env.SystemRoot || "C:\\Windows").toLowerCase();
+    if (normalized.toLowerCase().startsWith(winDir)) {
+      throw new Error("Access denied: Windows system directories are restricted.");
+    }
+  }
+}
+
+async function validateSafePath(
+  inputPath: string,
+  mode: "read" | "write",
+  mediaType: "image" | "video"
+): Promise<string> {
+  if (!inputPath || typeof inputPath !== "string") {
+    throw new Error("Invalid file path provided.");
+  }
+
+  const resolved = resolveHomePath(inputPath);
+  checkSensitivePath(resolved);
+
+  const ext = path.extname(resolved).toLowerCase();
+  const allowedExts = mediaType === "image" ? ALLOWED_IMAGE_EXTS : ALLOWED_VIDEO_EXTS;
+
+  if (ext && !allowedExts.has(ext)) {
+    throw new Error(
+      `File extension '${ext}' is not permitted for ${mediaType} operations. Allowed extensions: ${Array.from(allowedExts).join(", ")}`
+    );
+  }
+
+  if (mode === "read") {
+    if (!ext) {
+      throw new Error(`File path must have an explicit extension for ${mediaType} operations.`);
+    }
+    try {
+      const real = await fs.realpath(resolved);
+      checkSensitivePath(real);
+      const realExt = path.extname(real).toLowerCase();
+      if (!allowedExts.has(realExt)) {
+        throw new Error(`Resolved real file '${real}' has invalid extension '${realExt}'.`);
+      }
+      return real;
+    } catch (err: unknown) {
+      if (err instanceof Error && err.message.includes("Access denied")) {
+        throw err;
+      }
+      return resolved;
+    }
+  } else {
+    let curr = path.dirname(resolved);
+    let existingDir = "";
+    while (curr !== path.dirname(curr)) {
+      try {
+        await fs.access(curr);
+        existingDir = curr;
+        break;
+      } catch {
+        curr = path.dirname(curr);
+      }
+    }
+    if (existingDir) {
+      const realDir = await fs.realpath(existingDir);
+      checkSensitivePath(realDir);
+      const rel = path.relative(existingDir, resolved);
+      const canonical = path.resolve(realDir, rel);
+      checkSensitivePath(canonical);
+      return canonical;
+    }
+    return resolved;
+  }
+}
+
+function isPrivateOrReservedIP(ip: string): boolean {
+  let targetIp = ip;
+  if (targetIp.startsWith("::ffff:")) {
+    targetIp = targetIp.slice(7);
+  }
+
+  const family = net.isIP(targetIp);
+  if (family === 4) {
+    const parts = targetIp.split(".").map((n) => parseInt(n, 10));
+    if (parts.length !== 4 || parts.some((p) => isNaN(p) || p < 0 || p > 255)) {
+      return true;
+    }
+    const [b0, b1] = parts;
+
+    if (b0 === 0) return true;
+    if (b0 === 10) return true;
+    if (b0 === 127) return true;
+    if (b0 === 100 && b1 >= 64 && b1 <= 127) return true;
+    if (b0 === 169 && b1 === 254) return true;
+    if (b0 === 172 && b1 >= 16 && b1 <= 31) return true;
+    if (b0 === 192 && b1 === 0 && parts[2] === 0) return true;
+    if (b0 === 192 && b1 === 0 && parts[2] === 2) return true;
+    if (b0 === 192 && b1 === 168) return true;
+    if (b0 === 198 && (b1 === 18 || b1 === 19)) return true;
+    if (b0 === 198 && b1 === 51 && parts[2] === 100) return true;
+    if (b0 === 203 && b1 === 0 && parts[2] === 113) return true;
+    if (b0 >= 224) return true;
+
+    return false;
+  }
+
+  if (family === 6) {
+    const lower = targetIp.toLowerCase();
+    if (lower === "::" || lower === "::1" || lower.endsWith(":0001") || lower.startsWith("::1")) return true;
+    if (lower.startsWith("fc") || lower.startsWith("fd")) return true;
+    if (/^fe[89ab]/i.test(lower)) return true;
+    if (lower.startsWith("ff")) return true;
+    if (lower.startsWith("2001:db8")) return true;
+
+    return false;
+  }
+
+  return true;
+}
+
+async function validateUrlForSSRF(rawUrl: string): Promise<URL> {
+  let parsed: URL;
+  try {
+    parsed = new URL(rawUrl);
+  } catch {
+    throw new Error(`Invalid URL: '${rawUrl}'.`);
+  }
+
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    throw new Error(`Blocked URL scheme '${parsed.protocol}'. Only HTTP and HTTPS are permitted.`);
+  }
+
+  const hostname = parsed.hostname.toLowerCase();
+  if (
+    hostname === "localhost" ||
+    hostname.endsWith(".localhost") ||
+    hostname.endsWith(".local") ||
+    hostname.endsWith(".internal")
+  ) {
+    throw new Error(`Access to local or private domain '${hostname}' is prohibited.`);
+  }
+
+  if (net.isIP(hostname)) {
+    if (isPrivateOrReservedIP(hostname)) {
+      throw new Error(`Access to private, loopback, or cloud metadata IP '${hostname}' is blocked.`);
+    }
+  } else {
+    try {
+      const addresses = await dns.lookup(hostname, { all: true });
+      if (!addresses || addresses.length === 0) {
+        throw new Error(`Could not resolve hostname '${hostname}'.`);
+      }
+      for (const record of addresses) {
+        if (isPrivateOrReservedIP(record.address)) {
+          throw new Error(
+            `Domain '${hostname}' resolved to blocked private/internal IP '${record.address}'. Request prohibited.`
+          );
+        }
+      }
+    } catch (err: unknown) {
+      if (err instanceof Error && err.message.includes("blocked")) {
+        throw err;
+      }
+      throw new Error(`DNS resolution failed for '${hostname}': ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  return parsed;
 }
 
 function detectImageFormat(buffer: Buffer): { ext: string; mime: string } {
@@ -44,16 +297,97 @@ function detectImageFormat(buffer: Buffer): { ext: string; mime: string } {
   return { ext: "bin", mime: "application/octet-stream" };
 }
 
+async function safeFetchImage(
+  initialUrl: string,
+  maxBytes = MAX_IMAGE_BYTES,
+  timeoutMs = HTTP_TIMEOUT_MS
+): Promise<Buffer> {
+  let currentUrl = initialUrl;
+  let hops = 0;
+  const maxHops = 5;
+
+  while (hops < maxHops) {
+    const validated = await validateUrlForSSRF(currentUrl);
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+    let res: Response;
+    try {
+      res = await fetch(validated.href, {
+        signal: controller.signal,
+        redirect: "manual",
+        headers: {
+          "User-Agent": "remove-ai-signature-mcp/1.3.0",
+          Accept: "image/*,*/*;q=0.8",
+        },
+      });
+    } finally {
+      clearTimeout(timer);
+    }
+
+    if ([301, 302, 303, 307, 308].includes(res.status)) {
+      const location = res.headers.get("location");
+      if (!location) {
+        throw new Error(`HTTP ${res.status} redirect without Location header.`);
+      }
+      currentUrl = new URL(location, validated.href).href;
+      hops++;
+      continue;
+    }
+
+    if (!res.ok) {
+      throw new Error(`HTTP error ${res.status}: ${res.statusText}`);
+    }
+
+    const contentLength = res.headers.get("content-length");
+    if (contentLength) {
+      const bytes = parseInt(contentLength, 10);
+      if (!isNaN(bytes) && bytes > maxBytes) {
+        throw new Error(`Image size (${bytes} bytes) exceeds maximum allowed limit (${maxBytes} bytes).`);
+      }
+    }
+
+    if (!res.body) {
+      throw new Error("Empty response body received from server.");
+    }
+
+    const reader = res.body.getReader();
+    const chunks: Uint8Array[] = [];
+    let receivedBytes = 0;
+
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (value) {
+          receivedBytes += value.length;
+          if (receivedBytes > maxBytes) {
+            throw new Error(`Downloaded image exceeded size limit of ${maxBytes} bytes.`);
+          }
+          chunks.push(value);
+        }
+      }
+    } finally {
+      reader.releaseLock();
+    }
+
+    const buffer = Buffer.concat(chunks);
+    if (buffer.length === 0) {
+      throw new Error("Downloaded image buffer is empty.");
+    }
+
+    return buffer;
+  }
+
+  throw new Error(`Too many redirects (exceeded limit of ${maxHops}).`);
+}
+
 async function resolveImageBuffer(imageData: string): Promise<Buffer> {
   const trimmed = imageData.trim();
 
   if (trimmed.startsWith("http://") || trimmed.startsWith("https://")) {
-    const res = await fetch(trimmed);
-    if (!res.ok) {
-      throw new Error(`Failed to download image from URL: ${res.status} ${res.statusText}`);
-    }
-    const arrayBuffer = await res.arrayBuffer();
-    return Buffer.from(arrayBuffer);
+    return await safeFetchImage(trimmed);
   }
 
   if (trimmed.startsWith("data:")) {
@@ -66,13 +400,17 @@ async function resolveImageBuffer(imageData: string): Promise<Buffer> {
 
   if (trimmed.length < 1000) {
     try {
-      const resolvedPath = resolveHomePath(trimmed);
-      const stat = await fs.stat(resolvedPath);
-      if (stat.isFile()) {
-        return await fs.readFile(resolvedPath);
+      const safePath = await validateSafePath(trimmed, "read", "image");
+      const stat = await fs.stat(safePath);
+      if (stat.isFile() && stat.size <= MAX_IMAGE_BYTES) {
+        const buffer = await fs.readFile(safePath);
+        const format = detectImageFormat(buffer);
+        if (format.ext !== "bin") {
+          return buffer;
+        }
       }
     } catch {
-      // Not a file on disk, proceed to base64 decode
+      // Fallback to base64 decoding
     }
   }
 
@@ -185,7 +523,7 @@ async function getVideoInfo(filePath: string): Promise<VideoStreamInfo> {
 const server = new Server(
   {
     name: "remove-ai-signature",
-    version: "1.2.0",
+    version: "1.3.0",
   },
   {
     capabilities: {
@@ -225,8 +563,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
             overwrite: {
               type: "boolean",
-              description: "Overwrite target file if exists. Defaults to true.",
-              default: true,
+              description: "Overwrite target file if exists. Defaults to false.",
+              default: false,
             },
           },
           required: ["image_data", "output_path"],
@@ -245,7 +583,12 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
             output_path: {
               type: "string",
-              description: "Optional destination path. If omitted, overwrites file_path.",
+              description: "Optional destination path. If omitted, overwrites file_path in place.",
+            },
+            overwrite: {
+              type: "boolean",
+              description: "Overwrite target file if exists. Defaults to false.",
+              default: false,
             },
           },
           required: ["file_path"],
@@ -295,8 +638,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
             overwrite: {
               type: "boolean",
-              description: "Overwrite target file if exists. Defaults to true.",
-              default: true,
+              description: "Overwrite target file if exists. Defaults to false.",
+              default: false,
             },
           },
           required: ["file_path", "output_path"],
@@ -315,12 +658,12 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
             output_path: {
               type: "string",
-              description: "Optional destination path. If omitted, overwrites file_path.",
+              description: "Optional destination path. If omitted, overwrites file_path in place.",
             },
             overwrite: {
               type: "boolean",
-              description: "Overwrite destination if exists. Defaults to true.",
-              default: true,
+              description: "Overwrite destination if exists. Defaults to false.",
+              default: false,
             },
           },
           required: ["file_path"],
@@ -358,8 +701,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
             overwrite: {
               type: "boolean",
-              description: "Whether to overwrite the file if it exists. Defaults to true.",
-              default: true,
+              description: "Whether to overwrite the file if it exists. Defaults to false.",
+              default: false,
             },
           },
           required: ["image_data", "output_path"],
@@ -397,8 +740,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
             overwrite: {
               type: "boolean",
-              description: "Whether to overwrite the file if it exists. Defaults to true.",
-              default: true,
+              description: "Whether to overwrite the file if it exists. Defaults to false.",
+              default: false,
             },
           },
           required: ["url", "output_path"],
@@ -415,7 +758,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const imageData = String(args?.image_data ?? "");
     const outputPathRaw = String(args?.output_path ?? "");
     const stripMetadata = args?.strip_metadata !== false;
-    const overwrite = args?.overwrite !== false;
+    const overwrite = args?.overwrite === true;
 
     if (!imageData || !outputPathRaw) {
       return {
@@ -426,31 +769,59 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     try {
       const buffer = await resolveImageBuffer(imageData);
+      if (buffer.length === 0) {
+        return {
+          isError: true,
+          content: [{ type: "text", text: "Error: Decoded image buffer is empty." }],
+        };
+      }
+
+      const rawFormat = detectImageFormat(buffer);
+      if (rawFormat.ext === "bin") {
+        return {
+          isError: true,
+          content: [{ type: "text", text: "Error: Provided data is not a recognized image format." }],
+        };
+      }
+
       let cleanedBuffer = buffer;
       if (stripMetadata) {
         cleanedBuffer = stripJpegMetadataBuffer(stripPngMetadataBuffer(buffer));
       }
       const format = detectImageFormat(cleanedBuffer);
-      let targetPath = resolveHomePath(outputPathRaw);
+      checkSensitivePath(resolveHomePath(outputPathRaw));
+      let targetPathRaw = outputPathRaw;
 
-      if (!path.extname(targetPath) && format.ext !== "bin") {
-        targetPath = `${targetPath}.${format.ext}`;
+      if (!path.extname(targetPathRaw) && format.ext !== "bin") {
+        targetPathRaw = `${targetPathRaw}.${format.ext}`;
       }
+
+      const targetPath = await validateSafePath(targetPathRaw, "write", "image");
 
       if (!overwrite) {
         try {
           await fs.access(targetPath);
           return {
             isError: true,
-            content: [{ type: "text", text: `Error: File '${targetPath}' already exists and overwrite is false.` }],
+            content: [{ type: "text", text: `Error: Destination '${targetPath}' already exists and overwrite is false.` }],
           };
         } catch {
-          // File does not exist, can write
+          // File does not exist, safe to write
         }
       }
 
       await fs.mkdir(path.dirname(targetPath), { recursive: true });
-      await fs.writeFile(targetPath, cleanedBuffer);
+      try {
+        await fs.writeFile(targetPath, cleanedBuffer, { flag: overwrite ? "w" : "wx" });
+      } catch (err: unknown) {
+        if (err && typeof err === "object" && "code" in err && err.code === "EEXIST") {
+          return {
+            isError: true,
+            content: [{ type: "text", text: `Error: Destination '${targetPath}' already exists and overwrite is false.` }],
+          };
+        }
+        throw err;
+      }
 
       return {
         content: [
@@ -483,6 +854,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   if (name === "strip_metadata") {
     const filePathRaw = String(args?.file_path ?? "");
     const outputPathRaw = args?.output_path ? String(args.output_path) : filePathRaw;
+    const overwrite = args?.overwrite === true;
 
     if (!filePathRaw) {
       return {
@@ -492,13 +864,60 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     }
 
     try {
-      const sourcePath = resolveHomePath(filePathRaw);
-      const targetPath = resolveHomePath(outputPathRaw);
-      const buffer = await fs.readFile(sourcePath);
-      const cleanBuffer = stripJpegMetadataBuffer(stripPngMetadataBuffer(buffer));
+      const sourcePath = await validateSafePath(filePathRaw, "read", "image");
+      const targetPath = await validateSafePath(outputPathRaw, "write", "image");
 
+      const sourceStat = await fs.stat(sourcePath);
+      if (!sourceStat.isFile()) {
+        return {
+          isError: true,
+          content: [{ type: "text", text: `Error: '${sourcePath}' is not a regular file.` }],
+        };
+      }
+
+      if (sourceStat.size > MAX_IMAGE_BYTES) {
+        return {
+          isError: true,
+          content: [{ type: "text", text: `Error: File size (${sourceStat.size} bytes) exceeds limit (${MAX_IMAGE_BYTES} bytes).` }],
+        };
+      }
+
+      const isSameFile = path.resolve(sourcePath) === path.resolve(targetPath);
+      if (!isSameFile && !overwrite) {
+        try {
+          await fs.access(targetPath);
+          return {
+            isError: true,
+            content: [{ type: "text", text: `Error: Destination '${targetPath}' already exists and overwrite is false.` }],
+          };
+        } catch {
+          // File does not exist
+        }
+      }
+
+      const buffer = await fs.readFile(sourcePath);
+      const format = detectImageFormat(buffer);
+      if (format.ext === "bin") {
+        return {
+          isError: true,
+          content: [{ type: "text", text: "Error: File is not a recognized image format." }],
+        };
+      }
+
+      const cleanBuffer = stripJpegMetadataBuffer(stripPngMetadataBuffer(buffer));
       await fs.mkdir(path.dirname(targetPath), { recursive: true });
-      await fs.writeFile(targetPath, cleanBuffer);
+
+      try {
+        await fs.writeFile(targetPath, cleanBuffer, { flag: overwrite || isSameFile ? "w" : "wx" });
+      } catch (err: unknown) {
+        if (err && typeof err === "object" && "code" in err && err.code === "EEXIST") {
+          return {
+            isError: true,
+            content: [{ type: "text", text: `Error: Destination '${targetPath}' already exists and overwrite is false.` }],
+          };
+        }
+        throw err;
+      }
 
       return {
         content: [
@@ -531,7 +950,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   if (name === "strip_video_metadata") {
     const filePathRaw = String(args?.file_path ?? "");
     const outputPathRaw = args?.output_path ? String(args.output_path) : filePathRaw;
-    const overwrite = args?.overwrite !== false;
+    const overwrite = args?.overwrite === true;
 
     if (!filePathRaw) {
       return {
@@ -542,8 +961,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     try {
       const ffmpeg = await getFfmpegBinary();
-      const sourcePath = resolveHomePath(filePathRaw);
-      const targetPath = resolveHomePath(outputPathRaw);
+      const sourcePath = await validateSafePath(filePathRaw, "read", "video");
+      const targetPath = await validateSafePath(outputPathRaw, "write", "video");
 
       await fs.access(sourcePath);
 
@@ -622,7 +1041,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const method = String(args?.method ?? "delogo");
     const customRegion = args?.region as { height?: number; width?: number; x?: number; y?: number } | undefined;
     const stripMetadata = args?.strip_metadata !== false;
-    const overwrite = args?.overwrite !== false;
+    const overwrite = args?.overwrite === true;
 
     if (!filePathRaw || !outputPathRaw) {
       return {
@@ -633,8 +1052,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     try {
       const ffmpeg = await getFfmpegBinary();
-      const sourcePath = resolveHomePath(filePathRaw);
-      const targetPath = resolveHomePath(outputPathRaw);
+      const sourcePath = await validateSafePath(filePathRaw, "read", "video");
+      const targetPath = await validateSafePath(outputPathRaw, "write", "video");
 
       await fs.access(sourcePath);
 
@@ -701,7 +1120,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         y = H - h - Math.max(2, Math.round(H * 0.02));
       }
 
-      // Safe clamp boundaries
       x = Math.max(1, Math.min(x, W - 10));
       y = Math.max(1, Math.min(y, H - 10));
       w = Math.max(2, Math.min(w, W - x - 1));
@@ -717,7 +1135,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       } else if (method === "blur") {
         filterString = `split [main][crop_part]; [crop_part] crop=${w}:${h}:${x}:${y}, boxblur=12:12 [blur_part]; [main][blur_part] overlay=${x}:${y}`;
       } else {
-        // default delogo
         filterString = `delogo=x=${x}:y=${y}:w=${w}:h=${h}`;
       }
 
@@ -782,7 +1199,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     try {
       const ffprobe = await getFfprobeBinary();
-      const sourcePath = resolveHomePath(filePathRaw);
+      const sourcePath = await validateSafePath(filePathRaw, "read", "video");
       await fs.access(sourcePath);
 
       const { stdout } = await execFileAsync(ffprobe, [
@@ -844,7 +1261,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   if (name === "save_image") {
     const imageData = String(args?.image_data ?? "");
     const outputPathRaw = String(args?.output_path ?? "");
-    const overwrite = args?.overwrite !== false;
+    const overwrite = args?.overwrite === true;
 
     if (!imageData || !outputPathRaw) {
       return {
@@ -863,18 +1280,27 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       const format = detectImageFormat(buffer);
-      let targetPath = resolveHomePath(outputPathRaw);
-
-      if (!path.extname(targetPath) && format.ext !== "bin") {
-        targetPath = `${targetPath}.${format.ext}`;
+      if (format.ext === "bin") {
+        return {
+          isError: true,
+          content: [{ type: "text", text: "Error: Payload is not a recognized image format (PNG, JPEG, GIF, WEBP, BMP, SVG). Non-image files are prohibited." }],
+        };
       }
+
+      checkSensitivePath(resolveHomePath(outputPathRaw));
+      let targetPathRaw = outputPathRaw;
+      if (!path.extname(targetPathRaw) && format.ext !== "bin") {
+        targetPathRaw = `${targetPathRaw}.${format.ext}`;
+      }
+
+      const targetPath = await validateSafePath(targetPathRaw, "write", "image");
 
       if (!overwrite) {
         try {
           await fs.access(targetPath);
           return {
             isError: true,
-            content: [{ type: "text", text: `Error: File '${targetPath}' already exists and overwrite is false.` }],
+            content: [{ type: "text", text: `Error: Destination '${targetPath}' already exists and overwrite is false.` }],
           };
         } catch {
           // File does not exist, safe to write
@@ -882,7 +1308,17 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       await fs.mkdir(path.dirname(targetPath), { recursive: true });
-      await fs.writeFile(targetPath, buffer);
+      try {
+        await fs.writeFile(targetPath, buffer, { flag: overwrite ? "w" : "wx" });
+      } catch (err: unknown) {
+        if (err && typeof err === "object" && "code" in err && err.code === "EEXIST") {
+          return {
+            isError: true,
+            content: [{ type: "text", text: `Error: Destination '${targetPath}' already exists and overwrite is false.` }],
+          };
+        }
+        throw err;
+      }
 
       return {
         content: [
@@ -922,9 +1358,31 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     }
 
     try {
-      const targetPath = resolveHomePath(filePathRaw);
+      const targetPath = await validateSafePath(filePathRaw, "read", "image");
+      const stat = await fs.stat(targetPath);
+      if (!stat.isFile()) {
+        return {
+          isError: true,
+          content: [{ type: "text", text: `Error: '${targetPath}' is not a regular file.` }],
+        };
+      }
+
+      if (stat.size > MAX_IMAGE_BYTES) {
+        return {
+          isError: true,
+          content: [{ type: "text", text: `Error: File size (${stat.size} bytes) exceeds maximum limit (${MAX_IMAGE_BYTES} bytes).` }],
+        };
+      }
+
       const buffer = await fs.readFile(targetPath);
       const format = detectImageFormat(buffer);
+      if (format.ext === "bin") {
+        return {
+          isError: true,
+          content: [{ type: "text", text: "Error: File is not a valid image format. Non-image files cannot be read." }],
+        };
+      }
+
       const base64 = buffer.toString("base64");
       const dataUri = `data:${format.mime};base64,${base64}`;
 
@@ -960,7 +1418,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   if (name === "download_image") {
     const url = String(args?.url ?? "");
     const outputPathRaw = String(args?.output_path ?? "");
-    const overwrite = args?.overwrite !== false;
+    const overwrite = args?.overwrite === true;
 
     if (!url || !outputPathRaw) {
       return {
@@ -970,25 +1428,29 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     }
 
     try {
-      const res = await fetch(url);
-      if (!res.ok) {
-        throw new Error(`HTTP ${res.status}: ${res.statusText}`);
-      }
-      const arrayBuffer = await res.arrayBuffer();
-      const buffer = Buffer.from(arrayBuffer);
+      const buffer = await safeFetchImage(url);
       const format = detectImageFormat(buffer);
-
-      let targetPath = resolveHomePath(outputPathRaw);
-      if (!path.extname(targetPath) && format.ext !== "bin") {
-        targetPath = `${targetPath}.${format.ext}`;
+      if (format.ext === "bin") {
+        return {
+          isError: true,
+          content: [{ type: "text", text: "Error: Downloaded content is not a recognized image format." }],
+        };
       }
+
+      checkSensitivePath(resolveHomePath(outputPathRaw));
+      let targetPathRaw = outputPathRaw;
+      if (!path.extname(targetPathRaw) && format.ext !== "bin") {
+        targetPathRaw = `${targetPathRaw}.${format.ext}`;
+      }
+
+      const targetPath = await validateSafePath(targetPathRaw, "write", "image");
 
       if (!overwrite) {
         try {
           await fs.access(targetPath);
           return {
             isError: true,
-            content: [{ type: "text", text: `Error: File '${targetPath}' already exists and overwrite is false.` }],
+            content: [{ type: "text", text: `Error: Destination '${targetPath}' already exists and overwrite is false.` }],
           };
         } catch {
           // File does not exist, can write
@@ -996,7 +1458,17 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       await fs.mkdir(path.dirname(targetPath), { recursive: true });
-      await fs.writeFile(targetPath, buffer);
+      try {
+        await fs.writeFile(targetPath, buffer, { flag: overwrite ? "w" : "wx" });
+      } catch (err: unknown) {
+        if (err && typeof err === "object" && "code" in err && err.code === "EEXIST") {
+          return {
+            isError: true,
+            content: [{ type: "text", text: `Error: Destination '${targetPath}' already exists and overwrite is false.` }],
+          };
+        }
+        throw err;
+      }
 
       return {
         content: [
@@ -1121,7 +1593,7 @@ async function configureJsonAgent(configPath: string): Promise<void> {
 
   mcpServers["remove-ai-signature"] = {
     command: "npx",
-    args: ["-y", "remove-ai-signature"],
+    args: ["-y", "remove-ai-signature@1.3.0"],
   };
 
   json.mcpServers = mcpServers;
@@ -1144,7 +1616,7 @@ async function configureTomlAgent(configPath: string): Promise<void> {
   const snippet = `
 [mcp_servers.remove-ai-signature]
 command = "npx"
-args = ["-y", "remove-ai-signature"]
+args = ["-y", "remove-ai-signature@1.3.0"]
 `;
 
   content = (content.trim() + "\n" + snippet).trim() + "\n";
@@ -1155,7 +1627,7 @@ async function runInteractiveInstaller(): Promise<void> {
   const targets = getAgentTargets();
   const home = os.homedir();
 
-  process.stdout.write(`\n\x1b[1;36m✨ remove-ai-signature v1.2.0 — Auto-Configuration Wizard\x1b[0m\n\n`);
+  process.stdout.write(`\n\x1b[1;36m✨ remove-ai-signature v1.3.0 — Auto-Configuration Wizard\x1b[0m\n\n`);
 
   const selectedTargets = await new Promise<AgentTarget[]>((resolve) => {
     let cursorIndex = 0;
@@ -1261,13 +1733,11 @@ async function main() {
     return;
   }
 
-  // If piped into or spawned by an MCP host (non-TTY stdin) or explicitly requested stdio:
   if (!process.stdin.isTTY || isStdioExplicit) {
     await runMcpServer();
     return;
   }
 
-  // If executed in an interactive terminal by a human:
   await runInteractiveInstaller();
 }
 

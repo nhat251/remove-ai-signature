@@ -1,6 +1,6 @@
 {
   "name": "remove-ai-signature",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "description": "Model Context Protocol (MCP) server to detect, remove AI watermarks, signatures and strip EXIF/C2PA/video metadata directly on your local filesystem for images and videos.",
   "main": "dist/index.js",
   "bin": {

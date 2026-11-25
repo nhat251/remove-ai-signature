@@ -87,28 +87,29 @@ Removes AI watermarks (Midjourney, DALL-E, Canva, Recraft, etc.) from an image a
 - **`output_path`** *(string, required)*: Destination file path.
 - **`preset`** *(string, optional, default: `"bottom_right"`)*: `"bottom_right"` | `"bottom_left"` | `"top_right"` | `"top_left"` | `"bottom_bar"` | `"custom"`.
 - **`strip_metadata`** *(boolean, optional, default: `true`)*: Strip all EXIF, XMP, and C2PA metadata.
-- **`overwrite`** *(boolean, optional, default: `true`)*: Overwrite destination file if it exists.
+- **`overwrite`** *(boolean, optional, default: `false`)*: Overwrite destination file if it exists.
 
 #### 2. `strip_metadata`
 Losslessly strips 100% of metadata (EXIF, XMP, IPTC, ICC profile, GPS coordinates, camera serials, and AI generator tags) at the binary level.
 - **`file_path`** *(string, required)*: Path to image file.
 - **`output_path`** *(string, optional)*: Destination path. Overwrites source file if omitted.
+- **`overwrite`** *(boolean, optional, default: `false`)*.
 
 #### 3. `save_image`
-Saves an image to disk from Base64, Data URI, HTTP/HTTPS URL, or local path. Automatically creates parent directories and detects format from magic bytes.
+Saves an image to disk from Base64, Data URI, HTTP/HTTPS URL, or local path. Automatically creates parent directories, validates magic bytes, and enforces path confinement.
 - **`image_data`** *(string, required)*: Base64, Data URI, URL, or local path.
 - **`output_path`** *(string, required)*: Destination file path.
-- **`overwrite`** *(boolean, optional, default: `true`)*.
+- **`overwrite`** *(boolean, optional, default: `false`)*.
 
 #### 4. `read_image`
-Reads an image file from disk and returns Base64 & Data URI so multimodal LLMs can inspect it.
+Reads an image file from disk and returns Base64 & Data URI so multimodal LLMs can inspect it. Enforces strict image magic-bytes validation, path confinement, and 50MB file size limit.
 - **`file_path`** *(string, required)*: Path to image file.
 
 #### 5. `download_image`
-Downloads an image directly from a URL to a local destination file.
+Downloads an image directly from a URL to a local destination file. Features built-in SSRF protection (blocks loopback, private IPs, and cloud metadata endpoints).
 - **`url`** *(string, required)*: Image URL.
 - **`output_path`** *(string, required)*: Destination file path.
-- **`overwrite`** *(boolean, optional, default: `true`)*.
+- **`overwrite`** *(boolean, optional, default: `false`)*.
 
 ---
 
@@ -124,13 +125,13 @@ Removes AI watermarks and logos from video files (MP4, MOV, MKV, WebM) using `de
 - **`method`** *(string, optional, default: `"delogo"`)*: `"delogo"` | `"blur"` | `"crop"`.
 - **`region`** *(object, optional)*: Custom `{ x, y, width, height }` (supports percentage `0-100` or pixels) when `preset` is `"custom"`.
 - **`strip_metadata`** *(boolean, optional, default: `true`)*: Strip container metadata tags.
-- **`overwrite`** *(boolean, optional, default: `true`)*.
+- **`overwrite`** *(boolean, optional, default: `false`)*.
 
 #### 7. `strip_video_metadata`
 Losslessly strips 100% of metadata (encoder, creation time, handler names, tags, title, track metadata) from a video via stream-copy in **under 1 second** without re-encoding.
 - **`file_path`** *(string, required)*: Source video file path.
 - **`output_path`** *(string, optional)*: Destination path. Overwrites source file if omitted.
-- **`overwrite`** *(boolean, optional, default: `true`)*.
+- **`overwrite`** *(boolean, optional, default: `false`)*.
 
 #### 8. `inspect_video`
 Inspects technical video metadata, audio/video streams, codecs, resolution, bitrates, frame rates, and embedded tags via `ffprobe`.
