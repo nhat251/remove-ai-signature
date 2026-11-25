@@ -48,6 +48,21 @@ Run this single command in your terminal:
 claude mcp add remove-ai-signature npx -y remove-ai-signature
 ```
 
+### 3. Codex Desktop & Codex CLI
+
+Codex uses TOML format (`~/.codex/config.toml` or `.codex/config.toml` in your project root):
+
+```toml
+[mcp_servers.remove-ai-signature]
+command = "npx"
+args = ["-y", "remove-ai-signature"]
+```
+
+Or configure via **Codex Desktop GUI**:
+1. Open **Settings** $\rightarrow$ **Integrations** $\rightarrow$ **MCP Servers**
+2. Click **Add Server**
+3. Enter Name: `remove-ai-signature`, Command: `npx`, Arguments: `-y remove-ai-signature`
+
 ---
 
 ## 🛠️ Available Tools
