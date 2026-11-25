@@ -129,8 +129,8 @@ function stripPngMetadataBuffer(buffer: Buffer): Buffer {
 
 const server = new Server(
   {
-    name: "image-saver",
-    version: "1.1.0",
+    name: "remove-ai-signature",
+    version: "1.0.0",
   },
   {
     capabilities: {
